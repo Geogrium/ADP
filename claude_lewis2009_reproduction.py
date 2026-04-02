@@ -72,7 +72,7 @@ def simulate(K, steps=200, x_init=None):
     return np.array(xs), np.array(us), np.array(costs)
 
 
-def quad_basis(x):
+def quad_basis(x):  #我的理解是手动帮算法把非线性的关系计算出来
     """
     构造状态x的二次型基函数向量（上三角展开）。
     对于n维状态向量，共有 n(n+1)/2 个独立二次项。
@@ -89,7 +89,7 @@ def quad_basis(x):
     return np.array(feats)
 
 
-def quad_basis_aug(x, u):
+def quad_basis_aug(x, u):   #因为Q函数是状态和控制的二次型，所以需要把状态和控制拼接成增广向量，再做二次型展开
     """
     构造增广向量 z=[x;u] 的二次型基函数，用于Q函数逼近。
     Q(x,u) = z^T H z，其中z是状态和控制拼接的增广向量。
@@ -101,7 +101,7 @@ def quad_basis_aug(x, u):
     return quad_basis(z)          # 对增广向量做二次型展开
 
 
-def gradient_quad_basis(x):
+def gradient_quad_basis(x): # 后面涉及到对二次项特征求导，这个函数计算这些特征对状态的梯度，方便后续Actor更新时用链式法则计算控制梯度
     """
     计算二次型基函数 φ(x) 对状态 x 的Jacobian矩阵 ∂φ/∂x。
     形状为 (L, n)，其中 L=n(n+1)/2。
@@ -124,9 +124,20 @@ def gradient_quad_basis(x):
                 G[idx, j] += x[i]
             idx += 1
     return G
+'''
+当输入 x = [2, 3]（即 x_1 = 2, x_2 = 3）时，我们有 3 个特征：x_1^2、x_1 x_2、x_2^2。
+分别对三个特征求导，对x_1^2的导数是[4.0]
+对x_1 x_2的导数是[3,2]
+对x_2^2的导数是[0,6]
+故最终的Jacobian矩阵 G 是：
+[[4.0, 0.0],   # ∂(x_1^2)/∂x = [4.0, 0.0]
+ [3.0, 2.0],   # ∂(x_1 x_2)/∂x = [3.0, 2.0]
+ [0.0, 6.0]]   # ∂(x_2^2)/∂x = [0.0, 6.0]
+'''
 
 
-def recover_P_from_w(w):
+
+def recover_P_from_w(w):    #相当于是对前面quad_basis函数的逆操作，从值函数参数向量w恢复出对应的P矩阵，方便后续策略改进步骤使用
     """
     从值函数参数向量 w 恢复对称矩阵 P。
     V(x) = x^T P x = w^T φ(x)，其中φ是二次型基函数。
@@ -187,18 +198,16 @@ def stage2_policy_iteration(K_init, max_iter=50, tol=1e-8):
           P   : 对应的最优代价矩阵
           Ps  : 每次迭代的P矩阵列表（用于绘制收敛曲线）
     """
-    K = K_init.copy()   # 复制初始增益，避免修改外部变量
+    K = K_init.copy()   # 初始的控制策略，要求必须是稳定的（即A-BK的特征值模小于1），否则P会无穷大
     Ps = []             # 存储每步迭代的P，用于画收敛图
 
     for _ in range(max_iter):
-        Ac = A - B @ K   # 闭环系统矩阵：A_c = A - BK
-
+        
         # ── 策略评估：用Kronecker积把Lyapunov方程转化为线性方程组求解 ──
-        # Lyapunov方程：Ac^T P Ac - P = -(Q + K^T R K)
-        # 向量化(vec技巧)：(Ac^T ⊗ Ac^T - I) vec(P) = -vec(Q + K^T R K)
-        rhs = Q + K.T @ R @ K                      # 右端项矩阵
-        Av = np.kron(Ac.T, Ac.T) - np.eye(n * n)  # 系数矩阵（Kronecker积形式）
-        P = np.linalg.solve(Av, -rhs.flatten()).reshape(n, n)  # 求解线性系统
+        Ac = A - B @ K  
+        rhs = Q + K.T @ R @ K 
+        Av = np.kron(Ac.T, Ac.T) - np.eye(n * n)  # 计算机无法直接计算矩阵方程，克罗内积计算
+        P = np.linalg.solve(Av, -rhs.flatten()).reshape(n, n)  # 求解
 
         # ── 策略改进：根据新P计算新增益 ──
         K_new = np.linalg.solve(R + B.T @ P @ B, B.T @ P @ A)
@@ -233,14 +242,20 @@ def stage2_value_iteration(K_init, max_iter=200, tol=1e-8):
           tol     : 收敛判据（P矩阵变化的Frobenius范数）
     返回：K, P, Ps（同上）
     """
-    K = K_init.copy()  # 初始增益
+    K = K_init.copy()  # 初始的控制策略（不要求稳定，但过于不稳定可能导致数值问题）
     P = np.eye(n)      # 初始P矩阵（任意正定矩阵均可，这里用单位阵）
-    Ps = []            # 收敛历史
+    Ps = []            # 存储每步迭代的P，用于画收敛图
 
     for _ in range(max_iter):
         Ac = A - B @ K          # 闭环矩阵
         # 值更新（Lyapunov递推，一步迭代，非精确求解）
         P_new = Ac.T @ P @ Ac + Q + K.T @ R @ K
+
+        '''如果是Generalized Policy Iteration（GPI），这里的P更新就是多步迭代，只需要写一个for循环，迭代次数可以是1（对应值迭代）到无穷（对应策略迭代）。
+        for i in range(n_inner__steps):  # 内层迭代，更新P多次（可以是1到无穷）
+            P = Ac.T @ P @ Ac + Q + K.T @ R @ K
+        '''
+        
         # 策略改进
         K_new = np.linalg.solve(R + B.T @ P_new @ B, B.T @ P_new @ A)
         Ps.append(P_new.copy())
