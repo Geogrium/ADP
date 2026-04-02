@@ -18,59 +18,61 @@ def set_seed(seed=42):
 set_seed(42)
 
 # ========================================================
-# 模块零：上帝视角 —— 纯离散时间线性系统
+# 模块零：纯离散时间线性系统
 # ========================================================
 class DiscreteEnv:
     def __init__(self):
         self.state_dim = 2
         self.action_dim = 1
         
-        # 离散时间系统矩阵: x_{k+1} = A x_k + B u_k
+        #  x_{k+1} = A x_k + B u_k
         self.A = np.array([[0.9, 0.05], [0.1, 0.9]], dtype=np.float32)
         self.B = np.array([[0.0], [0.1]], dtype=np.float32)
-        
+        # r = x^T Q x + u^T R u 
         self.Q = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
         self.R = np.array([[0.1]], dtype=np.float32)
 
     def reset(self, x0=None):
-        if x0 is None:
+        if x0 is None:  # 随机初始化状态
             self.x = np.random.uniform(-2.0, 2.0, (self.state_dim, 1))
-        else:
+        else:           # 使用指定的初始状态
             self.x = np.array(x0, dtype=np.float32).reshape(self.state_dim, 1)
         return self.x.copy()
 
     def calc_cost(self, x, u):
-        # 纯离散单步代价: r_k = x_k^T Q x_k + u_k^T R u_k
+        # 单步代价: r_k = x_k^T Q x_k + u_k^T R u_k
         return (x.T @ self.Q @ x + u.T @ self.R @ u).item()
 
+    # 向前迈步，返回下一个状态和当前代价
     def step(self, u):
-        u = np.array(u).reshape(self.action_dim, 1)
+        u = np.array(u).reshape(self.action_dim, 1) # 确保 u 是(1, 1) 的向量
         cost = self.calc_cost(self.x, u)
         
         # 严格的离散状态转移方程，不再有 dt 参与
+        # x_{k+1} = A x_k + B u_k
         x_next = self.A @ self.x + self.B @ u
         self.x = x_next
-        
         return self.x.copy(), cost
 
-# 供 PyTorch 自动求导的离散动力学
+# 原先的xk是一个列向量，现在打包成一个批次的矩阵输入，适配神经网络训练
 def torch_discrete_dynamics(x, u, A_t, B_t):
     return x @ A_t.T + u @ B_t.T
 
 
 # ========================================================
-# 验证与可视化工具
+# 验证与可视化工具，这是为了比较不同算法的性能而编写的辅助函数
 # ========================================================
 def evaluate_and_plot(env: DiscreteEnv, K_star, actor_net, module_name=""):
-    x0 = np.array([[2.0], [-2.0]]) 
+    x0 = np.array([[2.0], [-2.0]])  #要求同一起点
     steps = 50 # 离散系统通常步数较少
     
-    # 1. 运行 DARE 最优 LQR 策略
+    # 1. 运行 DARE 最优 LQR 策略，得到理论最优解
     env.reset(x0)
-    lqr_traj = [env.x.copy()]
-    lqr_cost = 0.0
+    lqr_traj = [env.x.copy()]   #记录轨迹点
+    lqr_cost = 0.0  #记录总代价
+
     for _ in range(steps):
-        u = -K_star @ env.x
+        u = -K_star @ env.x #直接套用Riccati解得的最优增益矩阵 K_star
         x_next, cost = env.step(u)
         lqr_traj.append(x_next)
         lqr_cost += cost
@@ -79,21 +81,23 @@ def evaluate_and_plot(env: DiscreteEnv, K_star, actor_net, module_name=""):
     env.reset(x0)
     actor_traj = [env.x.copy()]
     actor_cost = 0.0
+
     for _ in range(steps):
-        if actor_net is None: break
-        x_tensor = torch.FloatTensor(env.x.T)
-        with torch.no_grad():
-            u = actor_net(x_tensor).numpy().T
-        x_next, cost = env.step(u)
-        actor_traj.append(x_next)
-        actor_cost += cost
+        if actor_net is None: break     # 防御性代码
+        x_tensor = torch.FloatTensor(env.x.T)   # 把env.x转换为 (1, 2) 行向量的批次输入，满足批处理要求
+        with torch.no_grad():   #满足离散系统的纯前向传播，不需要梯度计算
+            u = actor_net(x_tensor).numpy().T   #将输出转回numpy后再转置成1×1列向量
+        x_next, cost = env.step(u)  #按照该u执行一步，得到下一个状态和当前代价
+        actor_traj.append(x_next)   #记录
+        actor_cost += cost  #记录
         
-    lqr_traj = np.array(lqr_traj).squeeze()
-    actor_traj = np.array(actor_traj).squeeze()
+    lqr_traj = np.array(lqr_traj).squeeze() #将轨迹列表转换为 numpy 数组，并去掉多余的维度，适配后续绘图
+    actor_traj = np.array(actor_traj).squeeze() #同上
     
     plt.figure(figsize=(10, 4))
     plt.suptitle(f"[{module_name}] LQR Cost:{lqr_cost:.2f} | Actor Cost:{actor_cost:.2f}")
     
+    # 左侧图表，展示状态随时间的变化，观察能够平滑下降到0
     plt.subplot(1, 2, 1)
     plt.plot(lqr_traj[:, 0], label='LQR x1', linestyle='--')
     if actor_net is not None:
@@ -103,6 +107,7 @@ def evaluate_and_plot(env: DiscreteEnv, K_star, actor_net, module_name=""):
     plt.legend()
     plt.grid()
     
+    # 右侧相图，描述系统在状态空间中的“轨迹形状”，看两条线是否重合
     plt.subplot(1, 2, 2)
     plt.plot(lqr_traj[:, 0], lqr_traj[:, 1], label='LQR Phase', linestyle='--', marker='o', markersize=3)
     if actor_net is not None:
@@ -121,9 +126,9 @@ def evaluate_and_plot(env: DiscreteEnv, K_star, actor_net, module_name=""):
 # 模块一：离线 LQR (解离散代数黎卡提方程 DARE)
 # ========================================================
 def module1_offline_discrete_lqr(env: DiscreteEnv):
-    # 严格调用 solve_discrete_are
+    # 求解黎卡提方程，得到 P 矩阵 文中32式
     P = scipy.linalg.solve_discrete_are(env.A, env.B, env.Q, env.R)
-    # 离散系统的最优增益公式
+    # 离散系统的最优增益公式 文中31式
     K = np.linalg.inv(env.R + env.B.T @ P @ env.B) @ (env.B.T @ P @ env.A)
     print("\n--- 模块一：离线离散 LQR (DARE) ---")
     print(f"解得的离散 P 矩阵:\n{P}")
