@@ -295,25 +295,25 @@ def stage3_online_pi_vfa(K_init, n_pi_steps=8, n_rl_steps=600, gamma=1.0):
           P_approx : 最后一步的近似P矩阵
           Ps_approx: 每步外层迭代的P矩阵列表
     """
-    K = K_init.copy()      # 当前策略增益
-    Ps_approx = []         # 收敛历史
+    K = K_init.copy()      # 初始的控制策略，要求必须是稳定的（即A-BK的特征值模小于1），否则P会无穷大
+    Ps_approx = []         # 记录收敛轨迹
 
-    for pi_step in range(n_pi_steps):   # 外层：策略迭代循环
-        # ── 数据采集：固定当前策略K，沿轨迹收集 (x_k, x_{k+1}, r_k) ──
+    for pi_step in range(n_pi_steps):   # 外层：策略迭代循环，每跑一次更新一次K
+        # ── 数据采集：固定当前策略K，沿轨迹收集 (x_k, x_{k+1}, r_k) 
         X_k, X_k1, Rs = [], [], []
-        x = x0.copy() + np.random.randn(n) * 0.5   # 随机初始化（增加数据多样性）
-        for _ in range(n_rl_steps):
+        x = x0.copy() + np.random.randn(n) * 0.5   # 从不同位置出发
+        for _ in range(n_rl_steps): # 循环采集数据
             u = -K @ x + np.random.randn(m) * 0.05  # 控制=策略+探索噪声
             r = float(x @ Q @ x + u @ R @ u)         # 计算单步代价
-            xn = A @ x + B @ u                        # 系统状态转移（真实系统）
+            xn = A @ x + B @ u                        # 计算下一状态
             X_k.append(x.copy())    # 记录当前状态
             X_k1.append(xn.copy()) # 记录下一状态
             Rs.append(r)           # 记录代价
-            x = xn                 # 推进时间
+            x = xn                 # 下一步迭代
 
         # ── 构建TD回归矩阵并求解（批量LS）──
         # 每行：φ(x_k) - γ·φ(x_{k+1})，对应TD方程的"回归向量"
-        Phi = np.array([quad_basis(xk) - gamma * quad_basis(xk1)
+        Phi = np.array([quad_basis(xk) - gamma * quad_basis(xk1)    # 这里用到quad_basis函数把状态映射到特征空间，构建回归矩阵
                         for xk, xk1 in zip(X_k, X_k1)])  # 形状 (n_rl_steps, L)
         R_vec = np.array(Rs)    # 右端向量：单步代价序列
 
@@ -330,6 +330,58 @@ def stage3_online_pi_vfa(K_init, n_pi_steps=8, n_rl_steps=600, gamma=1.0):
 
     return K, P_approx, Ps_approx
 
+
+'''
+def stage3_online_vi_vfa(K_init, max_iter=200, n_rl_steps=600, gamma=1.0):
+    """
+    在线值迭代 (VI) + 值函数逼近 (VFA)
+    """
+    K = K_init.copy()
+    Ps_approx = []
+    
+    # 【修改点 1】：必须在循环外初始化一个“旧的”权重向量 w (对应论文的 W_j)
+    L = n * (n + 1) // 2
+    w = np.zeros(L) 
+
+    # 外层循环次数通常比 PI 多，因为 VI 是线性收敛
+    for vi_step in range(max_iter):
+        # ── 数据采集 (和之前完全一样) ──
+        X_k, X_k1, Rs = [], [], []
+        x = x0.copy() + np.random.randn(n) * 0.5
+        for _ in range(n_rl_steps):
+            u = -K @ x + np.random.randn(m) * 0.05
+            r = float(x @ Q @ x + u @ R @ u)
+            xn = A @ x + B @ u
+            X_k.append(x.copy())
+            X_k1.append(xn.copy())
+            Rs.append(r)
+            x = xn
+
+        # ── 【修改点 2】：构建 VI 的回归矩阵和目标值 ──
+        
+        # 1. 左边（回归矩阵）：只剩下当前状态的特征 φ(x_k)
+        Phi = np.array([quad_basis(xk) for xk in X_k])
+        
+        # 2. 右边（目标值 Target）：r_k + γ * V_old(x_{k+1})
+        # 注意这里用的是上一轮学到的旧权重 w 来评估未来！
+        Target = np.array([r + gamma * (w @ quad_basis(xk1)) 
+                           for r, xk1 in zip(Rs, X_k1)])
+
+        # ── 【修改点 3】：用最小二乘法求解新的权重 w_new ──
+        w_new, *_ = np.linalg.lstsq(Phi, Target, rcond=None)
+        
+        # 将新权重覆盖旧权重，为下一轮做准备
+        w = w_new.copy()
+
+        # ── 从参数向量 w 恢复对称矩阵 P，并做策略改进（和之前一样） ──
+        P_approx = recover_P_from_w(w)
+        Ps_approx.append(P_approx.copy())
+
+        K = np.linalg.solve(R + B.T @ P_approx @ B, B.T @ P_approx @ A)
+
+    return K, P_approx, Ps_approx
+
+    '''
 
 # ==============================================================================
 # Stage 4：Actor-Critic 双神经网络（只需B，Critic不需A，Actor不需A）
@@ -357,22 +409,23 @@ def stage4_actor_critic(K_init, n_pi_steps=10, n_rl_steps=800,
     K = K_init.copy()
     L = n * (n + 1) // 2   # 值函数基函数数量：n(n+1)/2
     w = np.zeros(L)         # Critic参数初始化为零向量
-    U = -K.T                # Actor参数初始化：u=U^T x=-Kx，U形状(n,m)
+    U = -K.T                # LQR中u = -Kx，所以Actor参数U初始化为-K^T，使得U^T x = -Kx，保证初始策略与之前一致
 
     Ps_approx, Ks = [], []  # 分别存P矩阵和K增益的历史
 
-    for pi_step in range(n_pi_steps):   # 外层迭代
+    for pi_step in range(n_pi_steps):   # 外层迭代，每次迭代先让Critic学习当前策略，然后让Actor根据Critic的打分改进策略
 
         # ── Critic 更新（在线梯度下降拟合值函数）──
-        x = x0.copy() + np.random.randn(n) * 0.5
-        w_c = w.copy()   # 本轮从上一轮结果出发继续训练
-        for _ in range(n_rl_steps):
+        x = x0.copy() + np.random.randn(n) * 0.5  # 每次从不同初始状态出发，增加探索
+        w_c = w.copy()   # 更新Critic权重，从上一轮结果出发继续训练
+
+        for _ in range(n_rl_steps):     # 一轮critic训练，采集数据并更新w
             u = U.T @ x + np.random.randn(m) * 0.05   # Actor输出+探索噪声
             r = float(x @ Q @ x + u @ R @ u)            # 单步代价
-            xn = A @ x + B @ u                           # 真实系统转移
+            xn = A @ x + B @ u                           # 下一步状态
 
-            phi_k  = quad_basis(x)    # 当前状态的基函数值
-            phi_k1 = quad_basis(xn)   # 下一状态的基函数值
+            phi_k  = quad_basis(x)    # 计算当前状态的基函数值
+            phi_k1 = quad_basis(xn)   # 计算下一状态的基函数值
 
             # TD误差（时间差分误差）= 实际代价 + 折扣后的下一步值估计 - 当前值估计
             # e_k = r_k + γ·V̂(x_{k+1}) - V̂(x_k) = r_k + γ·w^T φ(x_{k+1}) - w^T φ(x_k)
@@ -380,33 +433,34 @@ def stage4_actor_critic(K_init, n_pi_steps=10, n_rl_steps=800,
 
             # 梯度下降更新w：w ← w + α·[φ(x_k)-γ·φ(x_{k+1})]·e_k
             # 这是TD(0)的参数化版本，最小化TD误差的均方期望
-            Fk = phi_k - gamma * phi_k1   # 回归向量（TD方程中的φ差值）
-            w_c = w_c + alpha * Fk * td_err
-            x = xn   # 推进时间
+            Fk = phi_k - gamma * phi_k1   # 计算回归向量（TD方程49式中的φ差值）
+            w_c = w_c + alpha * Fk * td_err # 对应公式50，梯度下降，但是因为Fk是phi_k - gamma*phi_k1，所以给负号抵消了，所以这里是加号
+            x = xn   # 下一步迭代
 
         w = w_c   # 用本轮学到的w更新全局Critic参数
 
-        # 从w恢复P矩阵用于记录
+        # 从w恢复P矩阵用于记录和Actor更新
         P_approx = recover_P_from_w(w)
         Ps_approx.append(P_approx.copy())
 
         # ── Actor 更新（梯度下降最小化值函数，通过B将状态梯度转为控制梯度）──
         x = x0.copy() + np.random.randn(n) * 0.5
-        for _ in range(n_rl_steps):
-            u_curr = U.T @ x             # 当前Actor输出的控制量
-            xn = A @ x + B @ u_curr      # 状态转移
+        for _ in range(n_rl_steps): #内层Actor更新，采集数据并更新U
+            u_curr = U.T @ x             # 当前Actor参数输出的u
+            xn = A @ x + B @ u_curr      # 下一步
 
+            '''链式法则dV/du = dV/dx * dx/du，其中dx/du = B（线性系统），所以dV/du = B^T * dV/dx。
+            一直到该循环结束，这一部分对应原文中的56式'''
             # 计算值函数对x_{k+1}的梯度：∂V/∂x_{k+1} = (∂φ/∂x)^T · w
-            grad_phi = gradient_quad_basis(xn)   # Jacobian (L, n)
-            dV_dx = grad_phi.T @ w               # ∂V/∂x，形状(n,)
-
+            grad_phi = gradient_quad_basis(xn)   # 计算特征向量phi相对于下一状态的雅可比矩阵
+            dV_dx = grad_phi.T @ w               # 应用链式法则，特征对状态的偏导乘以权重得到值函数对状态的梯度，指示了梯度方向
             # 通过B矩阵将状态梯度映射为控制梯度：∂V/∂u = B^T · ∂V/∂x（需要B！）
             dV_du = B.T @ dV_dx   # 形状(m,)
 
             # 对Actor参数U的梯度：∂/∂U [u^T R u + γ·(∂V/∂u)^T u]
             # u = U^T x，所以 ∂u/∂U = x⊗I_m，展开得到：
+            # 因为要更新的是U而非u，所以要乘x，特征x是(n,)维的列向量，dV_du是(m,)维的行向量，所以外积得到(n,m)维的梯度矩阵
             grad_U = x.reshape(-1, 1) @ (2 * R @ u_curr + gamma * dV_du).reshape(1, -1)
-
             # 梯度下降更新Actor参数U
             U = U - beta * grad_U
             x = xn
@@ -462,22 +516,23 @@ def stage5_q_learning(K_init, n_pi_steps=12, n_rl_steps=1000,
             z_k  = quad_basis_aug(x,  u)   # 当前增广基函数 ψ(z_k)
             z_k1 = quad_basis_aug(xn, un)  # 下一增广基函数 ψ(z_{k+1})
 
-            # Q函数TD回归向量：ψ(z_k) - γ·ψ(z_{k+1})
+            # 构建用于最小二乘法的回归方程：左边是特征差值，右边是实际的单步代价r。
+            # Q函数TD回归向量：ψ(z_k) - γ·ψ(z_{k+1}) 78式
             Phi_list.append(z_k - gamma * z_k1)
             R_list.append(r)
             x = xn
 
-        # ── 批量LS求解Q函数参数H_vec ──
+        # ── 批量LS求解Q函数参数H_vec ── 78式
         Phi  = np.array(Phi_list)   # 回归矩阵 (n_rl_steps, aug_dim)
         R_vec = np.array(R_list)    # 单步代价向量
-        H_vec, *_ = np.linalg.lstsq(Phi, R_vec, rcond=None)
+        H_vec, *_ = np.linalg.lstsq(Phi, R_vec, rcond=None) #最小二乘法求解得到Critic的权重H
         Hs.append(H_vec.copy())
 
         # ── 重建对称H矩阵（对应Q函数的二次型核矩阵）──
         aug = n + m
         H_mat = np.zeros((aug, aug))
         idx = 0
-        for i in range(aug):
+        for i in range(aug):    #把一维矩阵变为二维对称矩阵，与recover_P_from_w类似，但这里是H矩阵，维度是(n+m)×(n+m)
             for j in range(i, aug):
                 if i == j:
                     H_mat[i, j] = H_vec[idx]
@@ -497,8 +552,8 @@ def stage5_q_learning(K_init, n_pi_steps=12, n_rl_steps=1000,
         # ── 策略改进（完全不需要A或B！）──
         # 最优控制：∂Q*/∂u = 0 → H_uu·u + H_ux·x = 0 → u* = -H_uu^{-1}·H_ux·x
         try:
-            K = np.linalg.solve(H_uu, H_ux)   # K = H_uu^{-1} H_ux
-        except np.linalg.LinAlgError:
+            K = np.linalg.solve(H_uu, H_ux)   # K = H_uu^{-1} H_ux，最优增益矩阵
+        except np.linalg.LinAlgError:   #H_uu可能不可逆，无法求逆，此时保持旧K不变
             pass   # 奇异时保持旧K
 
     return K, H_vec, H_mat, Hs
@@ -546,16 +601,15 @@ def stage6_ct_policy_iteration(K_init, n_pi_steps=10,
 
     def simulate_ct_segment(x_start, K_ct, duration, dt_sim):
         """
-        Euler法积分一段CT轨迹，同时累积代价积分。
+        在一段duration进行模拟
         返回：最终状态 x_end 和区间代价积分 ∫r dτ。
         """
         x = x_start.copy()
         int_cost = 0.0                          # 区间代价积分初始化
         steps = int(duration / dt_sim)          # 积分步数
         for _ in range(steps):
-            u = -K_ct @ x + np.random.randn(m) * 0.02   # 加小探索噪声
-            # 代价积分：用矩形法近似 ∫r dτ ≈ Σ r(x,u)·dt
-            int_cost += float(x @ Q_ct @ x + u @ R_ct @ u) * dt_sim
+            u = -K_ct @ x + np.random.randn(m) * 0.02   # 在每个微小片段算出u加小探索噪声
+            int_cost += float(x @ Q_ct @ x + u @ R_ct @ u) * dt_sim # 瞬时代价 * 时间步长，用矩形法近似 ∫r dτ ≈ Σ r(x,u)·dt
             x = x + (A_ct @ x + B_ct @ u) * dt_sim   # Euler积分：x_{t+dt}=x_t+ẋ·dt
         return x, int_cost
 
